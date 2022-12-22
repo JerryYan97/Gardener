@@ -14,7 +14,5 @@ find_package(Boost 1.81.0 REQUIRED COMPONENTS
 if(Boost_FOUND)
     include_directories(${Boost_INCLUDE_DIRS})
     add_executable(SimplePrints ${SOURCE})
-    set(LibName Boost::fiber)
-    message(STATUS "fiber lib: ${LibName}")
     target_link_libraries(SimplePrints Boost::fiber Boost::context)
 endif()
