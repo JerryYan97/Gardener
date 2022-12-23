@@ -8,6 +8,10 @@
 
 #include <boost/fiber/all.hpp>
 
+/*
+*   Used to test whether the boost::fiber is configured correctly.
+*/
+
 inline
 void fn(std::string const& str, int n) {
     for (int i = 0; i < n; ++i) {
