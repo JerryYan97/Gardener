@@ -23,8 +23,15 @@ namespace Gardener
 
         void SetEntryFunc(const PfnJobEntry& func) { m_pfnEntryPoint = func; }
 
-    private:
+    protected:
         PfnJobEntry m_pfnEntryPoint;
+    };
+
+    class JobQueue
+    {
+    public:
+        JobQueue() = default;
+        ~JobQueue() {}
     };
 
     class JobSystem
