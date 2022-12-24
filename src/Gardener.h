@@ -16,6 +16,10 @@ namespace boost
     }
 }
 
+// TODO: Code standard enforcement.
+// S postfix on data name for shared resources.
+// T postfix on function name for thread syn.
+// F postfix on function name for fiber syn (non-preemptive).
 namespace Gardener
 {
     // The function signature for a job's execution function pointer.
@@ -84,17 +88,22 @@ namespace Gardener
         void StartWork();
 
         // Block the caller thread until the works are done and safe to be deleted.
-        // This function would delete the current thread object.
+        // This function would delete the current thread object and terminate all running fibers.
         void StopWork();
 
     private:
         // Executed in the worker thread, this func is responsible for constantly grabbing the works from the job queue.
         static void WorkerLoop(Worker* pWorker);
+
+        // The wrapper function is used to spawn a fiber. In this func, it would do preamble and postamble 
+        static void EntryFuncWrapper(Worker* pWorker, Job* pJob);
         
         std::thread*          m_pThread;
         uint32_t              m_coreIdAffinity;
 
         std::unordered_map<uint64_t, boost::fibers::fiber*> m_fiberList;
+
+        std::queue<uint64_t> m_retiredJobQueue; // Used to free fibers in the fiberList during each workerLoop. 
 
         // The stop signal would be shared between the main thread and the worker thread. When the StopWork() is called
         // in the main thread, it would set the stop signal to true. Meanwhile in the worker thread's WorkerLoop(), the
@@ -102,7 +111,7 @@ namespace Gardener
         bool                  m_stopSignal;
         std::mutex            m_stopSignalMutex;
 
-        JobQueue* const       m_pJobQueue;
+        JobQueue* const       m_pJobQueue; // Reference to the job queue of getting jobs to do.
     };
 
     /*  
@@ -135,7 +144,7 @@ namespace Gardener
         // Called by the worker when it finishes the job.
         void JobFinishes(const uint64_t jobId);
 
-        // If the job finishes, the func would return nullptr.
+        // If the job finishes, the func would return nullptr. Fibers should not use this function.
         Job* GetJobPtrFromId(uint64_t jobId);
 
     private:
@@ -145,10 +154,11 @@ namespace Gardener
 
         std::unordered_map<uint64_t, Job*>*  m_pJobsHandleTable; // The handle table stores all jobs instances.
         uint64_t                             m_servedJobsCnt;    // Will be used to assign a unique ID for the input
-                                                                 // job.
+                                                                 // job. Shared Resource.
         std::mutex                           m_handleTblMutex;   // The job handle table maybe accessd by multiple 
                                                                  // threads. E.g. The main thread adds jobs to the
                                                                  // table. The worker threads remove jobs from the
-                                                                 // handle table.
+                                                                 // handle table or add jobs from the fiber. Shared
+                                                                 // resource.
     };
 }

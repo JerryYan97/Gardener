@@ -13,7 +13,7 @@ namespace Gardener
         m_pJobQueue = new JobQueue();
         m_pJobsHandleTable = new std::unordered_map<uint64_t, Job*>();
 
-        // Kick off workers
+        // Creating and kicking off workers
         for (uint32_t i = 0; i < m_workersCnt; i++)
         {
             m_ppWorkers[i] = new Worker(m_pJobQueue, i);
@@ -45,6 +45,8 @@ namespace Gardener
     Job* JobSystem::GetJobPtrFromId(
         uint64_t jobId)
     {
+        // Handle table is a shared resrouce among threads, which needs to be syned.
+        std::lock_guard<std::mutex> lock(m_handleTblMutex);
         if (m_pJobsHandleTable->find(jobId) != m_pJobsHandleTable->end())
         {
             // The jobId is in the handle table.
@@ -62,10 +64,10 @@ namespace Gardener
         PfnJobEntry jobEntry,
         uint64_t& jobId)
     {
-        Job* pJob = new Job(jobEntry, m_servedJobsCnt);
-        pJob->SetEntryFunc(jobEntry);
+        Job* pJob = nullptr;
         {
             std::lock_guard<std::mutex> lock(m_handleTblMutex);
+            pJob = new Job(jobEntry, m_servedJobsCnt);
             m_pJobsHandleTable->insert({ m_servedJobsCnt, pJob });
         }
 
@@ -77,10 +79,8 @@ namespace Gardener
     // ================================================================================================================
     void JobSystem::JobFinishes(const uint64_t jobId)
     {
-        {
-            std::lock_guard<std::mutex> lock(m_handleTblMutex);
-            m_pJobsHandleTable->erase(jobId);
-        }
+        std::lock_guard<std::mutex> lock(m_handleTblMutex);
+        m_pJobsHandleTable->erase(jobId);
     }
 
     // ================================================================================================================
@@ -92,11 +92,12 @@ namespace Gardener
     {}
 
     // ================================================================================================================
-    void Worker::WorkerLoop(Worker* pWorker)
+    void Worker::WorkerLoop(
+        Worker* pWorker)
     {
         while (1)
         {
-            // Check whether the worker gets a stop signal.
+            // Check whether the worker gets a stop signal. Jump out of the loop if there is one.
             {
                 std::lock_guard<std::mutex> stopSigLock(pWorker->m_stopSignalMutex);
                 if (pWorker->m_stopSignal)
@@ -105,22 +106,29 @@ namespace Gardener
                 }
             }
 
+            // Get a job from the jobQueue. If there is one, then we create a fiber for it and execute it. If not, we
+            // come back to the spin-lock to check the queue until there is a stop signal or there is a job.
             Job* pJob = pWorker->m_pJobQueue->SendOutAJob();
             if (pJob != nullptr)
             {
-                // If there is a job that we can work on.
-                pWorker->m_fiberList.insert({ pJob->GetId(), new boost::fibers::fiber(pJob->GetEntryFunc()) });
+                // If there is a job that we can work on. TODO: We may don't need the pWorker input.
+                pWorker->m_fiberList.insert({ pJob->GetId(), 
+                                              new boost::fibers::fiber(&Worker::EntryFuncWrapper, pWorker, pJob)});
             }
-            
         }
     }
 
     // ================================================================================================================
-    Worker::~Worker()
+    void Worker::EntryFuncWrapper(
+        Worker* pWorker, 
+        Job* pJob)
     {}
 
-    void func()
-    {}
+    // ================================================================================================================
+    Worker::~Worker()
+    {
+        StopWork();
+    }
 
     // ================================================================================================================
     void Worker::StartWork()
@@ -134,8 +142,15 @@ namespace Gardener
     void Worker::StopWork()
     {
         // Block the caller thread to wait for the worker thread.
-        m_pThread->join();
-        delete m_pThread;
+        if (m_pThread != nullptr)
+        {
+            m_pThread->join();
+            for (auto& itr : m_fiberList)
+            {
+                delete itr.second;
+            }
+            delete m_pThread;
+        }
     }
 
     // ================================================================================================================
