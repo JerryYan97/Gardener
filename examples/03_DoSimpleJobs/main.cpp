@@ -75,7 +75,7 @@ public:
 
     void MyTaskFunc()
     {
-        m_taskRes = m_taskId;
+        m_taskRes = m_taskId * m_taskId;
     }
 
     void PrintTaskRes()
