@@ -1,5 +1,21 @@
+#pragma once
+
 // Gardener header
 #include <cstdint>
+
+namespace boost
+{
+    namespace fibers
+    {
+        class mutex;
+        class fiber;
+    }
+}
+
+namespace std
+{
+    class thread;
+}
 
 namespace Gardener
 {
@@ -18,8 +34,8 @@ namespace Gardener
     class Job
     {
     public:
-        Job() = default;
-        ~Job() {}
+        Job();
+        ~Job();
 
         void SetEntryFunc(const PfnJobEntry& func) { m_pfnEntryPoint = func; }
 
@@ -27,23 +43,63 @@ namespace Gardener
         PfnJobEntry m_pfnEntryPoint;
     };
 
+    // Job queue maintains a ring buffer used to store job pointers.
     class JobQueue
     {
     public:
-        JobQueue() = default;
-        ~JobQueue() {}
+        JobQueue(uint32_t queueSize);
+        ~JobQueue();
+
+        void AcquireAJob();
+        void SendAJob();
+        void SendJobs();
+
+        boost::fibers::mutex* m_pQueueAccessMutex;
+    private:
+        
+        uint32_t m_jobCnt;
+        Job**    m_ppHeader;
+
+        uint32_t m_queueSize;
+        Job**    m_ppJobsRingBuffer;
     };
 
+    // Each worker is bound to a thread and executes jobs in the job queue.
+    class Worker
+    {
+    public:
+        Worker();
+        ~Worker();
+
+        void StartThread();
+
+        // 
+        void WorkerLoop();
+
+    private:
+        
+        std::thread*          m_pThread;
+        boost::fibers::fiber* m_pFibers;
+        uint32_t              m_fiberNum;
+    };
+
+    // Job system gets jobs' function pointers from the outside, which is the main interface.
     class JobSystem
     {
     public:
-        JobSystem() = default;
-        ~JobSystem() {}
+        JobSystem(uint32_t threadNum);
+        ~JobSystem();
 
-        void SpawnJob(const Job& job);
-        void SpawnJobs(const Job* const pJobs, uint32_t jobCnt);
+        // Add jobs into the job queue managed by the job system.
+        void AddAJob(PfnJobEntry jobEntry);
+        void AddJobs(PfnJobEntry* const pJobsEntries, uint32_t jobCnt);
+
+        // The srcJobEntry would execute after the desJobEntry finishes.
+        void AddDepJobs(PfnJobEntry srcJobEntry, PfnJobEntry dstJobEntry);
+
     private:
-
-        uint32_t m_jobCnt;
+        JobQueue* m_pJobQueue;
+        Worker*   m_pWorkers;
+        uint32_t  m_workersCnt;
     };
 }
