@@ -79,10 +79,11 @@ namespace Gardener
         // Spawn a thread and let the thread execute the WorkerLoop().
         void StartWork();
 
-        // Block the caller thread until the works are done and safe to be deleted.
-        // This function is normally called by the main thread. It signals the worker thread to stop. Then, it would
-        // delete the current thread object and terminate all running fibers.
-        void StopWork();
+        // Block the caller thread until the works are done and release all the heap memory managed by the worker.
+        // This function is normally called by the main thread in the worker's destructor. It signals the worker thread
+        // to stop. Then, it would wait the worker thread to finish. Then it deletes the current thread object and
+        // terminate all running fibers.
+        void StopWorkFT();
 
     private:
         // Executed in the worker thread, this func is responsible for constantly grabbing the works from the job queue.
@@ -94,7 +95,9 @@ namespace Gardener
         std::thread*          m_pThread;
         uint32_t              m_coreIdAffinity;
 
-        std::unordered_map<uint64_t, boost::fibers::fiber*> m_fiberList;
+        // The fiber list is shared between the main thread and the worker thread. It won't have the contension because
+        // the main thread only access it after the worker thread joins. So, no need for the protection.
+        std::unordered_map<uint64_t, boost::fibers::fiber*> m_fiberListS;
 
         // Used to free fibers in the fiberList during each workerLoop. This queue is shared among all the fibers in
         // in the worker and we need to give it protection. The fiber mutex is collabrative, which means if a fiber is

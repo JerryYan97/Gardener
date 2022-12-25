@@ -146,8 +146,8 @@ namespace Gardener
                 pWorker->m_retiredJobQueueMutex.unlock();
                 isLock = false;
 
-                delete pWorker->m_fiberList.at(id);
-                pWorker->m_fiberList.erase(id);
+                delete pWorker->m_fiberListS.at(id);
+                pWorker->m_fiberListS.erase(id);
 
                 // Tell the job system to delete the job from the memory.
                 pWorker->m_pJobSysS->AJobDone();
@@ -164,7 +164,7 @@ namespace Gardener
             if (pJob != nullptr)
             {
                 // If there is a job that we can work on.
-                pWorker->m_fiberList.insert({ pJob->GetId(), 
+                pWorker->m_fiberListS.insert({ pJob->GetId(),
                                               new boost::fibers::fiber(&Worker::EntryFuncWrapperF, pWorker, pJob)});
             }
         }
@@ -189,7 +189,7 @@ namespace Gardener
     // ================================================================================================================
     Worker::~Worker()
     {
-        StopWork();
+        StopWorkFT();
     }
 
     // ================================================================================================================
@@ -201,7 +201,7 @@ namespace Gardener
     }
 
     // ================================================================================================================
-    void Worker::StopWork()
+    void Worker::StopWorkFT()
     {
         // Block the caller thread to wait for the worker thread.
         if (m_pThread != nullptr)
@@ -211,12 +211,13 @@ namespace Gardener
                 m_stopSignalS = true;
             }
 
-            for (auto& itr : m_fiberList)
+            // Wait until the worker thread stop working. We can delete all the fiber objects in the worker.
+            m_pThread->join();
+            for (auto& itr : m_fiberListS)
             {
                 itr.second->join();
                 delete itr.second;
             }
-            m_pThread->join();
             delete m_pThread;
         }
     }
