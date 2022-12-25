@@ -73,9 +73,9 @@ public:
 
     ~CustomTask() {}
 
-    void MyTaskFunc()
+    static void MyTaskFunc(CustomTask* pThisTask)
     {
-        m_taskRes = m_taskId * m_taskId;
+        pThisTask->m_taskRes = pThisTask->m_taskId * pThisTask->m_taskId;
     }
 
     void PrintTaskRes()
@@ -84,8 +84,9 @@ public:
                   << m_taskRes << std::endl;
     }
 
+    uint64_t m_taskId;
+
 private:
-    uint32_t m_taskId;
     uint32_t m_taskRes;
 };
 
@@ -121,6 +122,15 @@ int main()
 
     for (uint32_t i = 0; i < 10; i++)
     {
+        std::cout << typeid (&tasks[i]->MyTaskFunc).name() << std::endl;
+        jobSys.AddAJob(&tasks[i]->MyTaskFunc, tasks[i], tasks[i]->m_taskId);
+    }
+
+    jobSys.WaitJobsComplete();
+
+    for (uint32_t i = 0; i < 10; i++)
+    {
+        tasks[i]->PrintTaskRes();
         delete tasks[i];
     }
 }

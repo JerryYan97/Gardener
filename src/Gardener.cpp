@@ -1,14 +1,14 @@
 #include "Gardener.h"
 #include "GardenerUtils.h"
 #include <boost/fiber/all.hpp>
-
+#include <type_traits>
 namespace Gardener
 {
     // ================================================================================================================
     JobSystem::JobSystem(
         uint32_t threadNum) :
         m_workersCnt(threadNum),
-        m_ppWorkers(nullptr)
+        m_doneJobsCnt(0)
     {
         m_pJobQueue = new JobQueue();
         m_pJobsHandleTable = new std::unordered_map<uint64_t, Job*>();
@@ -16,18 +16,17 @@ namespace Gardener
         // Creating and kicking off workers
         for (uint32_t i = 0; i < m_workersCnt; i++)
         {
-            m_ppWorkers[i] = new Worker(m_pJobQueue, i);
-            m_ppWorkers[i]->StartWork();
+            m_pWorkers.push_back(new Worker(m_pJobQueue, i));
+            m_pWorkers.back()->StartWork();
         }
     }
 
     // ================================================================================================================
     JobSystem::~JobSystem()
     {
-        for (uint32_t i = 0; i < m_workersCnt; i++)
+        for (Worker* itr : m_pWorkers)
         {
-            m_ppWorkers[i]->StopWork();
-            delete m_ppWorkers[i];
+            delete itr;
         }
 
         if (m_pJobQueue != nullptr)
@@ -60,14 +59,16 @@ namespace Gardener
     }
 
     // ================================================================================================================
-    void JobSystem::AddAJob(
-        PfnJobEntry jobEntry,
+    void JobSystem::AddAJobInternal(
+        void* jobEntry,
+        void* pTask,
         uint64_t& jobId)
     {
         Job* pJob = nullptr;
         {
             std::lock_guard<std::mutex> lock(m_handleTblMutex);
-            pJob = new Job(jobEntry, m_servedJobsCnt);
+            PfnJobEntry castEntry = static_cast<PfnJobEntry>(jobEntry);
+            pJob = new Job(castEntry, pTask, m_servedJobsCnt);
             m_pJobsHandleTable->insert({ m_servedJobsCnt, pJob });
         }
 
@@ -75,7 +76,7 @@ namespace Gardener
 
         jobId = m_servedJobsCnt++;
     }
-
+    
     // ================================================================================================================
     void JobSystem::JobFinishes(const uint64_t jobId)
     {
@@ -84,11 +85,38 @@ namespace Gardener
     }
 
     // ================================================================================================================
+    void JobSystem::WaitJobsComplete()
+    {
+        while (1)
+        {
+            std::lock_guard<std::mutex> lock(m_doneJobsCntMutex);
+            if (m_doneJobsCnt == m_servedJobsCnt)
+            {
+                break;
+            }
+        }
+    }
+
+    void JobSystem::AJobDone()
+    {
+        while (m_doneJobsCntMutex.try_lock() == false)
+        {
+            boost::this_fiber::yield();
+        }
+
+        m_doneJobsCnt++;
+
+        m_doneJobsCntMutex.unlock();
+    }
+
+    // ================================================================================================================
     Worker::Worker(
-        JobQueue* const pJobQueue,
+        JobQueue* pJobQueue,
         uint32_t affinityCoreId)
         : m_pJobQueue(pJobQueue),
-          m_coreIdAffinity(affinityCoreId)
+          m_coreIdAffinity(affinityCoreId),
+          m_stopSignal(false),
+          m_pThread(nullptr)
     {}
 
     // ================================================================================================================
@@ -106,12 +134,32 @@ namespace Gardener
                 }
             }
 
+            // Retire all the jobs in the retire queue. 
+            // (Free all fibers with the job ids specified in the retired queue)
+            /*
+            if (pWorker->m_retiredJobQueueMutex.try_lock())
+            {
+                
+            }
+            */
+
+            while (pWorker->m_retiredJobQueue.empty() != true)
+            {
+                uint64_t id = pWorker->m_retiredJobQueue.front();
+                pWorker->m_retiredJobQueue.pop();
+
+                delete pWorker->m_fiberList.at(id);
+                pWorker->m_fiberList.erase(id);
+
+                // Tell the job system to delete the job from the memory.
+            }
+            
             // Get a job from the jobQueue. If there is one, then we create a fiber for it and execute it. If not, we
-            // come back to the spin-lock to check the queue until there is a stop signal or there is a job.
+            // come back to the spinning loop to check the queue until there is a stop signal or there is a job.
             Job* pJob = pWorker->m_pJobQueue->SendOutAJob();
             if (pJob != nullptr)
             {
-                // If there is a job that we can work on. TODO: We may don't need the pWorker input.
+                // If there is a job that we can work on.
                 pWorker->m_fiberList.insert({ pJob->GetId(), 
                                               new boost::fibers::fiber(&Worker::EntryFuncWrapper, pWorker, pJob)});
             }
@@ -120,9 +168,17 @@ namespace Gardener
 
     // ================================================================================================================
     void Worker::EntryFuncWrapper(
-        Worker* pWorker, 
+        Worker* pWorker,
         Job* pJob)
-    {}
+    {
+        // Execute the custom job
+        pJob->GetEntryFunc()(pJob->GetCustomTask());
+
+        // Put the finished job ID into the Retirement queue. The main fiber of this thread will loop through this
+        // queue to signal the job system to delete the job from the jobs table and increase the counter for the
+        // overall synchronization.
+        pWorker->m_retiredJobQueue.push(pJob->GetId());
+    }
 
     // ================================================================================================================
     Worker::~Worker()
@@ -144,43 +200,69 @@ namespace Gardener
         // Block the caller thread to wait for the worker thread.
         if (m_pThread != nullptr)
         {
-            m_pThread->join();
+            {
+                std::lock_guard<std::mutex> stopSigLock(m_stopSignalMutex);
+                m_stopSignal = true;
+            }
+
             for (auto& itr : m_fiberList)
             {
+                itr.second->join();
                 delete itr.second;
             }
+            m_pThread->join();
             delete m_pThread;
         }
     }
 
     // ================================================================================================================
     JobQueue::JobQueue()
-    {
-        m_pQueueAccessMutex = new boost::fibers::mutex();
-    }
+    {}
 
     // ================================================================================================================
     JobQueue::~JobQueue()
-    {
-        delete m_pQueueAccessMutex;
-    }
+    {}
     
     // ================================================================================================================
-    void JobQueue::SendInAJob(Job* pJob)
-    {}
+    void JobQueue::SendInAJob(
+        Job* pJob)
+    {
+        std::lock_guard<std::mutex> lock(m_queueAccessMutex);
+        m_queue.push(pJob);
+    }
 
     // ================================================================================================================
     Job* JobQueue::SendOutAJob()
     {
-        return nullptr;
+        // This function would be called by fibers from different threads. So, we need to syn them in a collabrative 
+        // way.
+        while (m_queueAccessMutex.try_lock() == false)
+        {
+            boost::this_fiber::yield();
+        }
+        
+        if (m_queue.empty())
+        {
+            m_queueAccessMutex.unlock();
+            return nullptr;
+        }
+        else
+        {
+            Job* pJob = m_queue.front();
+            m_queue.pop();
+            m_queueAccessMutex.unlock();
+            return pJob;
+        }
     }
 
     // ================================================================================================================
     Job::Job(
-        const PfnJobEntry& func, 
+        const PfnJobEntry& func,
+        void* pCustomTask,
         uint64_t jobId)
         : m_pfnEntryPoint(func),
-          m_jobId(jobId)
+          m_jobId(jobId),
+          m_pCustomTask(pCustomTask)
     {}
 
     // ================================================================================================================

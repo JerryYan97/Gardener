@@ -6,6 +6,7 @@
 #include <queue>
 #include <thread>
 #include <mutex>
+#include <list>
 
 namespace boost
 {
@@ -18,42 +19,37 @@ namespace boost
 
 // TODO: Code standard enforcement.
 // S postfix on data name for shared resources.
-// T postfix on function name for thread syn.
-// F postfix on function name for fiber syn (non-preemptive).
+// T postfix on function name with thread syn.
+// F postfix on function name with fiber syn (non-preemptive).
 namespace Gardener
 {
-    // The function signature for a job's execution function pointer.
-    typedef void (*PfnJobEntry)();
+    class JobSystem;
 
-    enum JobStatusEnum
-    {
-        IN_QUEUE, IN_WORKER
-    };
+    // The function signature for a job's execution function pointer.
+    typedef void (*PfnJobEntry)(void*);
 
     /*
     *   Represents a customizable job. The job can be spawned through AddAJob(...), AddJobs(...) or AddDepJobs(...)
     *   interfaces specified in the JobSystem class.
     * 
-    *   The user should notice that they can and should use the Boost functionalities in the provided function pointer.
+    *   The user should notice that they should be aware of the Boost functionalities in the provided function pointer.
     *   And the provided function pointer would be executed in a Boost::fiber after spawning.
     *   Examples can be found in the Gardener's example folder.
     */
     class Job
     {
     public:
-        explicit Job(const PfnJobEntry& func, uint64_t jobId);
+        explicit Job(const PfnJobEntry& func, void* pCustomTask, uint64_t jobId);
         ~Job();
 
-        void SetEntryFunc(const PfnJobEntry& func) { m_pfnEntryPoint = func; }
         PfnJobEntry GetEntryFunc() const { return m_pfnEntryPoint; }
-
         uint64_t GetId() const { return m_jobId; }
+        void* GetCustomTask() const { return m_pCustomTask; }
 
     private:
         PfnJobEntry           m_pfnEntryPoint;
         uint64_t              m_jobId;
-        JobStatusEnum         m_status;
-        boost::fibers::fiber* m_pFiber;
+        void*                 m_pCustomTask;
     };
 
     // Job queue maintains a queue to store job pointers.
@@ -71,9 +67,11 @@ namespace Gardener
 
         void SendJobs();
 
+        bool Empty();
+
     private:
-        boost::fibers::mutex* m_pQueueAccessMutex;
-        std::queue<Job*> m_queue;
+        std::mutex m_queueAccessMutex;
+        std::queue<Job*> m_queue; // The queue of jobs that are waiting for workers.
 
     };
 
@@ -81,14 +79,15 @@ namespace Gardener
     class Worker
     {
     public:
-        explicit Worker(JobQueue* const pJobQueue, uint32_t affinityCoreId);
+        Worker(JobQueue* pJobQueue, uint32_t affinityCoreId);
         ~Worker();
 
         // Spawn a thread and let the thread execute the WorkerLoop().
         void StartWork();
 
         // Block the caller thread until the works are done and safe to be deleted.
-        // This function would delete the current thread object and terminate all running fibers.
+        // This function is normally called by the main thread. It signals the worker thread to stop. Then, it would
+        // delete the current thread object and terminate all running fibers.
         void StopWork();
 
     private:
@@ -104,6 +103,7 @@ namespace Gardener
         std::unordered_map<uint64_t, boost::fibers::fiber*> m_fiberList;
 
         std::queue<uint64_t> m_retiredJobQueue; // Used to free fibers in the fiberList during each workerLoop. 
+        // boost::fibers::mutex m_retiredJobQueueMutex;
 
         // The stop signal would be shared between the main thread and the worker thread. When the StopWork() is called
         // in the main thread, it would set the stop signal to true. Meanwhile in the worker thread's WorkerLoop(), the
@@ -111,7 +111,9 @@ namespace Gardener
         bool                  m_stopSignal;
         std::mutex            m_stopSignalMutex;
 
-        JobQueue* const       m_pJobQueue; // Reference to the job queue of getting jobs to do.
+        JobQueue*             m_pJobQueue; // Reference to the job queue of getting jobs.
+
+        JobSystem*            m_pJobSysS;
     };
 
     /*  
@@ -134,8 +136,17 @@ namespace Gardener
         JobSystem(uint32_t threadNum);
         ~JobSystem();
 
-        // Add jobs into the job queue managed by the job system.
-        void AddAJob(PfnJobEntry jobEntry, uint64_t& jobId);
+        // Create and add jobs into the job queue managed by the job system.
+        template<typename FT, typename T>
+        inline void AddAJob(FT jobEntry, T* pTask, uint64_t& jobId)
+        {
+            // Check whether the user provids a proper job entry function pointer.
+            typedef void (*PfnJobEntryInput)(T*);
+            static_assert(std::is_same<FT, PfnJobEntryInput>::value, 
+                          "The input jobEntry function pointer is incompatiable with the input pTask pointer.");
+            AddAJobInternal(static_cast<void*>(jobEntry), static_cast<void*>(pTask), jobId);
+        }
+
         void AddJobs(PfnJobEntry* const pJobsEntries, uint32_t jobCnt, uint64_t* jobIds);
 
         // The srcJobEntry would execute after the desJobEntry finishes.
@@ -147,9 +158,16 @@ namespace Gardener
         // If the job finishes, the func would return nullptr. Fibers should not use this function.
         Job* GetJobPtrFromId(uint64_t jobId);
 
+        // Wait for all submitted jobs done in the main thread.
+        void WaitJobsComplete();
+
+        void AJobDone();
+
     private:
+        void AddAJobInternal(void* jobEntry, void* pTask, uint64_t& jobId);
+
         JobQueue* m_pJobQueue;
-        Worker**  m_ppWorkers;
+        std::list<Worker*> m_pWorkers;
         uint32_t  m_workersCnt;
 
         std::unordered_map<uint64_t, Job*>*  m_pJobsHandleTable; // The handle table stores all jobs instances.
@@ -160,5 +178,7 @@ namespace Gardener
                                                                  // table. The worker threads remove jobs from the
                                                                  // handle table or add jobs from the fiber. Shared
                                                                  // resource.
+        uint64_t                             m_doneJobsCnt;
+        std::mutex                           m_doneJobsCntMutex;
     };
 }
