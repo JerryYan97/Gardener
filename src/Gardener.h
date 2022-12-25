@@ -1,21 +1,13 @@
 #pragma once
 
 // Gardener header
+#include <boost/fiber/all.hpp>
 #include <cstdint>
 #include <unordered_map>
 #include <queue>
 #include <thread>
 #include <mutex>
 #include <list>
-
-namespace boost
-{
-    namespace fibers
-    {
-        class mutex;
-        class fiber;
-    }
-}
 
 // TODO: Code standard enforcement.
 // S postfix on data name for shared resources.
@@ -35,6 +27,8 @@ namespace Gardener
     *   The user should notice that they should be aware of the Boost functionalities in the provided function pointer.
     *   And the provided function pointer would be executed in a Boost::fiber after spawning.
     *   Examples can be found in the Gardener's example folder.
+    * 
+    *   The job system is responsible for managing the the life time of a job.
     */
     class Job
     {
@@ -47,9 +41,9 @@ namespace Gardener
         void* GetCustomTask() const { return m_pCustomTask; }
 
     private:
-        PfnJobEntry           m_pfnEntryPoint;
-        uint64_t              m_jobId;
-        void*                 m_pCustomTask;
+        PfnJobEntry m_pfnEntryPoint;
+        uint64_t    m_jobId;
+        void*       m_pCustomTask;
     };
 
     // Job queue maintains a queue to store job pointers.
@@ -79,7 +73,7 @@ namespace Gardener
     class Worker
     {
     public:
-        Worker(JobQueue* pJobQueue, uint32_t affinityCoreId);
+        Worker(JobQueue* const pJobQueue, JobSystem* const pJobSys, uint32_t affinityCoreId);
         ~Worker();
 
         // Spawn a thread and let the thread execute the WorkerLoop().
@@ -92,28 +86,32 @@ namespace Gardener
 
     private:
         // Executed in the worker thread, this func is responsible for constantly grabbing the works from the job queue.
-        static void WorkerLoop(Worker* pWorker);
+        static void WorkerLoopFT(Worker* pWorker);
 
         // The wrapper function is used to spawn a fiber. In this func, it would do preamble and postamble 
-        static void EntryFuncWrapper(Worker* pWorker, Job* pJob);
+        static void EntryFuncWrapperF(Worker* pWorker, Job* pJob);
         
         std::thread*          m_pThread;
         uint32_t              m_coreIdAffinity;
 
         std::unordered_map<uint64_t, boost::fibers::fiber*> m_fiberList;
 
-        std::queue<uint64_t> m_retiredJobQueue; // Used to free fibers in the fiberList during each workerLoop. 
-        // boost::fibers::mutex m_retiredJobQueueMutex;
+        // Used to free fibers in the fiberList during each workerLoop. This queue is shared among all the fibers in
+        // in the worker and we need to give it protection. The fiber mutex is collabrative, which means if a fiber is
+        // unable to own the mutex, it just gives control back to the scheduler.
+        std::queue<uint64_t> m_retiredJobQueueS; 
+        boost::fibers::mutex m_retiredJobQueueMutex;
 
         // The stop signal would be shared between the main thread and the worker thread. When the StopWork() is called
         // in the main thread, it would set the stop signal to true. Meanwhile in the worker thread's WorkerLoop(), the
         // worker thread would peroidically check whether it needs to stop working on new jobs in the job queue.
-        bool                  m_stopSignal;
+        bool                  m_stopSignalS;
         std::mutex            m_stopSignalMutex;
 
-        JobQueue*             m_pJobQueue; // Reference to the job queue of getting jobs.
-
-        JobSystem*            m_pJobSysS;
+        JobQueue* const       m_pJobQueueS; // Reference to the job queue of getting jobs. Shared between fibers.
+                                            // Read only, no need for protection.
+        JobSystem* const      m_pJobSysS;  // Reference to the job system to informing the system that a job has done.
+                                           // Shared between fibers. Read only, no need for protection.
     };
 
     /*  

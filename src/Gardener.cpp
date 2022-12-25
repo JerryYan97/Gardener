@@ -1,7 +1,6 @@
 #include "Gardener.h"
 #include "GardenerUtils.h"
-#include <boost/fiber/all.hpp>
-#include <type_traits>
+
 namespace Gardener
 {
     // ================================================================================================================
@@ -16,7 +15,7 @@ namespace Gardener
         // Creating and kicking off workers
         for (uint32_t i = 0; i < m_workersCnt; i++)
         {
-            m_pWorkers.push_back(new Worker(m_pJobQueue, i));
+            m_pWorkers.push_back(new Worker(m_pJobQueue, this, i));
             m_pWorkers.back()->StartWork();
         }
     }
@@ -111,16 +110,18 @@ namespace Gardener
 
     // ================================================================================================================
     Worker::Worker(
-        JobQueue* pJobQueue,
-        uint32_t affinityCoreId)
-        : m_pJobQueue(pJobQueue),
+        JobQueue*  const pJobQueue,
+        JobSystem* const pJobSys,
+        uint32_t         affinityCoreId)
+        : m_pJobQueueS(pJobQueue),
           m_coreIdAffinity(affinityCoreId),
-          m_stopSignal(false),
-          m_pThread(nullptr)
+          m_stopSignalS(false),
+          m_pThread(nullptr),
+          m_pJobSysS(pJobSys)
     {}
 
     // ================================================================================================================
-    void Worker::WorkerLoop(
+    void Worker::WorkerLoopFT(
         Worker* pWorker)
     {
         while (1)
@@ -128,7 +129,7 @@ namespace Gardener
             // Check whether the worker gets a stop signal. Jump out of the loop if there is one.
             {
                 std::lock_guard<std::mutex> stopSigLock(pWorker->m_stopSignalMutex);
-                if (pWorker->m_stopSignal)
+                if (pWorker->m_stopSignalS)
                 {
                     break;
                 }
@@ -136,38 +137,41 @@ namespace Gardener
 
             // Retire all the jobs in the retire queue. 
             // (Free all fibers with the job ids specified in the retired queue)
-            /*
-            if (pWorker->m_retiredJobQueueMutex.try_lock())
+            pWorker->m_retiredJobQueueMutex.lock();
+            bool isLock = true;
+            while (pWorker->m_retiredJobQueueS.empty() != true)
             {
-                
-            }
-            */
-
-            while (pWorker->m_retiredJobQueue.empty() != true)
-            {
-                uint64_t id = pWorker->m_retiredJobQueue.front();
-                pWorker->m_retiredJobQueue.pop();
+                uint64_t id = pWorker->m_retiredJobQueueS.front();
+                pWorker->m_retiredJobQueueS.pop();
+                pWorker->m_retiredJobQueueMutex.unlock();
+                isLock = false;
 
                 delete pWorker->m_fiberList.at(id);
                 pWorker->m_fiberList.erase(id);
 
                 // Tell the job system to delete the job from the memory.
+                pWorker->m_pJobSysS->AJobDone();
+            }
+
+            if (isLock)
+            {
+                pWorker->m_retiredJobQueueMutex.unlock();
             }
             
             // Get a job from the jobQueue. If there is one, then we create a fiber for it and execute it. If not, we
             // come back to the spinning loop to check the queue until there is a stop signal or there is a job.
-            Job* pJob = pWorker->m_pJobQueue->SendOutAJob();
+            Job* pJob = pWorker->m_pJobQueueS->SendOutAJob();
             if (pJob != nullptr)
             {
                 // If there is a job that we can work on.
                 pWorker->m_fiberList.insert({ pJob->GetId(), 
-                                              new boost::fibers::fiber(&Worker::EntryFuncWrapper, pWorker, pJob)});
+                                              new boost::fibers::fiber(&Worker::EntryFuncWrapperF, pWorker, pJob)});
             }
         }
     }
 
     // ================================================================================================================
-    void Worker::EntryFuncWrapper(
+    void Worker::EntryFuncWrapperF(
         Worker* pWorker,
         Job* pJob)
     {
@@ -177,7 +181,9 @@ namespace Gardener
         // Put the finished job ID into the Retirement queue. The main fiber of this thread will loop through this
         // queue to signal the job system to delete the job from the jobs table and increase the counter for the
         // overall synchronization.
-        pWorker->m_retiredJobQueue.push(pJob->GetId());
+        pWorker->m_retiredJobQueueMutex.lock();
+        pWorker->m_retiredJobQueueS.push(pJob->GetId());
+        pWorker->m_retiredJobQueueMutex.unlock();
     }
 
     // ================================================================================================================
@@ -190,7 +196,7 @@ namespace Gardener
     void Worker::StartWork()
     {
         // Spawn a thread with worker loop. Note that this func is called in the main thread.
-        m_pThread = new std::thread(&Worker::WorkerLoop, this);
+        m_pThread = new std::thread(&Worker::WorkerLoopFT, this);
         SetThreadAffinity(*m_pThread, m_coreIdAffinity);
     }
 
@@ -202,7 +208,7 @@ namespace Gardener
         {
             {
                 std::lock_guard<std::mutex> stopSigLock(m_stopSignalMutex);
-                m_stopSignal = true;
+                m_stopSignalS = true;
             }
 
             for (auto& itr : m_fiberList)
