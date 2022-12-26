@@ -6,16 +6,16 @@ namespace Gardener
     // ================================================================================================================
     JobSystem::JobSystem(
         uint32_t threadNum) :
-        m_workersCnt(threadNum),
-        m_doneJobsCnt(0)
+        m_doneJobsCntS(0),
+        m_servedJobsCnt(0)
     {
-        m_pJobQueue = new JobQueue();
-        m_pJobsHandleTable = new std::unordered_map<uint64_t, Job*>();
+        m_pJobQueueS = new JobQueue();
+        m_pJobsHandleTableS = new std::unordered_map<uint64_t, Job*>();
 
         // Creating and kicking off workers
-        for (uint32_t i = 0; i < m_workersCnt; i++)
+        for (uint32_t i = 0; i < threadNum; i++)
         {
-            m_pWorkers.push_back(new Worker(m_pJobQueue, this, i));
+            m_pWorkers.push_back(new Worker(m_pJobQueueS, this, i));
             m_pWorkers.back()->StartWork();
         }
     }
@@ -28,59 +28,44 @@ namespace Gardener
             delete itr;
         }
 
-        if (m_pJobQueue != nullptr)
+        if (m_pJobQueueS != nullptr)
         {
-            delete m_pJobQueue;
+            delete m_pJobQueueS;
         }
 
-        if (m_pJobsHandleTable != nullptr)
+        if (m_pJobsHandleTableS != nullptr)
         {
-            delete m_pJobsHandleTable;
+            delete m_pJobsHandleTableS;
         }
     }
 
     // ================================================================================================================
-    Job* JobSystem::GetJobPtrFromId(
-        uint64_t jobId)
-    {
-        // Handle table is a shared resrouce among threads, which needs to be syned.
-        std::lock_guard<std::mutex> lock(m_handleTblMutex);
-        if (m_pJobsHandleTable->find(jobId) != m_pJobsHandleTable->end())
-        {
-            // The jobId is in the handle table.
-            return m_pJobsHandleTable->at(jobId);
-        }
-        else
-        {
-            // The jobId is not in the handle table.
-            return nullptr;
-        }
-    }
-
-    // ================================================================================================================
-    void JobSystem::AddAJobInternal(
+    void JobSystem::AddAJobInternalF(
         void* jobEntry,
         void* pTask,
         uint64_t& jobId)
     {
         Job* pJob = nullptr;
         {
-            std::lock_guard<std::mutex> lock(m_handleTblMutex);
+            m_handleTblMutex.lock();
             PfnJobEntry castEntry = static_cast<PfnJobEntry>(jobEntry);
             pJob = new Job(castEntry, pTask, m_servedJobsCnt);
-            m_pJobsHandleTable->insert({ m_servedJobsCnt, pJob });
+            m_pJobsHandleTableS->insert({ m_servedJobsCnt, pJob });
+            m_handleTblMutex.unlock();
         }
 
-        m_pJobQueue->SendInAJob(pJob);
+        m_pJobQueueS->SendInAJobF(pJob);
 
         jobId = m_servedJobsCnt++;
     }
     
     // ================================================================================================================
-    void JobSystem::JobFinishes(const uint64_t jobId)
+    void JobSystem::JobFinishesF(const uint64_t jobId)
     {
-        std::lock_guard<std::mutex> lock(m_handleTblMutex);
-        m_pJobsHandleTable->erase(jobId);
+        m_handleTblMutex.lock();
+        m_pJobsHandleTableS->erase(jobId);
+        m_doneJobsCntS++;
+        m_handleTblMutex.unlock();
     }
 
     // ================================================================================================================
@@ -88,24 +73,14 @@ namespace Gardener
     {
         while (1)
         {
-            std::lock_guard<std::mutex> lock(m_doneJobsCntMutex);
-            if (m_doneJobsCnt == m_servedJobsCnt)
+            m_handleTblMutex.lock();
+            if (m_doneJobsCntS == m_servedJobsCnt)
             {
+                m_handleTblMutex.unlock();
                 break;
             }
+            m_handleTblMutex.unlock();
         }
-    }
-
-    void JobSystem::AJobDone()
-    {
-        while (m_doneJobsCntMutex.try_lock() == false)
-        {
-            boost::this_fiber::yield();
-        }
-
-        m_doneJobsCnt++;
-
-        m_doneJobsCntMutex.unlock();
     }
 
     // ================================================================================================================
@@ -150,7 +125,7 @@ namespace Gardener
                 pWorker->m_fiberListS.erase(id);
 
                 // Tell the job system to delete the job from the memory.
-                pWorker->m_pJobSysS->AJobDone();
+                pWorker->m_pJobSysS->JobFinishesF(id);
             }
 
             if (isLock)
@@ -160,7 +135,7 @@ namespace Gardener
             
             // Get a job from the jobQueue. If there is one, then we create a fiber for it and execute it. If not, we
             // come back to the spinning loop to check the queue until there is a stop signal or there is a job.
-            Job* pJob = pWorker->m_pJobQueueS->SendOutAJob();
+            Job* pJob = pWorker->m_pJobQueueS->SendOutAJobF();
             if (pJob != nullptr)
             {
                 // If there is a job that we can work on.
@@ -231,35 +206,31 @@ namespace Gardener
     {}
     
     // ================================================================================================================
-    void JobQueue::SendInAJob(
+    void JobQueue::SendInAJobF(
         Job* pJob)
     {
-        std::lock_guard<std::mutex> lock(m_queueAccessMutex);
-        m_queue.push(pJob);
+        // The main thread is implicitly a main fiber even though we didn't explicitly launch one. It would just
+        // spinning if the mutex is owned by others.
+        m_queueAccessMutex.lock();
+        m_queueS.push(pJob);
+        m_queueAccessMutex.unlock();
     }
 
     // ================================================================================================================
-    Job* JobQueue::SendOutAJob()
+    Job* JobQueue::SendOutAJobF()
     {
-        // This function would be called by fibers from different threads. So, we need to syn them in a collabrative 
-        // way.
-        while (m_queueAccessMutex.try_lock() == false)
-        {
-            boost::this_fiber::yield();
-        }
+        // It the fiber caller is blocked here, it just jumps back to the scheduler of the attached thread.
+        m_queueAccessMutex.lock();
+        Job* pRes = nullptr;
         
-        if (m_queue.empty())
+        if (m_queueS.empty() == false)
         {
-            m_queueAccessMutex.unlock();
-            return nullptr;
+            pRes = m_queueS.front();
+            m_queueS.pop();
         }
-        else
-        {
-            Job* pJob = m_queue.front();
-            m_queue.pop();
-            m_queueAccessMutex.unlock();
-            return pJob;
-        }
+
+        m_queueAccessMutex.unlock();
+        return pRes;
     }
 
     // ================================================================================================================

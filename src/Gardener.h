@@ -24,7 +24,7 @@ namespace Gardener
     *   Represents a customizable job. The job can be spawned through AddAJob(...), AddJobs(...) or AddDepJobs(...)
     *   interfaces specified in the JobSystem class.
     * 
-    *   The user should notice that they should be aware of the Boost functionalities in the provided function pointer.
+    *   The user should be aware of the Boost functionalities in the provided function pointer.
     *   And the provided function pointer would be executed in a Boost::fiber after spawning.
     *   Examples can be found in the Gardener's example folder.
     * 
@@ -46,7 +46,11 @@ namespace Gardener
         void*       m_pCustomTask;
     };
 
-    // Job queue maintains a queue to store job pointers.
+    // Job queue maintains a queue to store job pointers sent from the job system and would sent job pointers to the
+    // worker that request jobs.
+    //
+    // It also maintains the syn in its interfaces, so we don't need to manage the syn in the job system object and let
+    // workers access the job queue object indirectly through the job system.
     class JobQueue
     {
     public:
@@ -54,18 +58,14 @@ namespace Gardener
         ~JobQueue();
 
         // This function is called by a worker to get work.
-        Job* SendOutAJob();
+        Job* SendOutAJobF();
 
-        // This function is called by the job system to put a job into the queue.
-        void SendInAJob(Job* pJob);
-
-        void SendJobs();
-
-        bool Empty();
+        // This function is called by the job system to put a job into the queue. It may blocks the caller thread 
+        void SendInAJobF(Job* pJob);
 
     private:
-        std::mutex m_queueAccessMutex;
-        std::queue<Job*> m_queue; // The queue of jobs that are waiting for workers.
+        boost::fibers::mutex m_queueAccessMutex;
+        std::queue<Job*>     m_queueS;           // The queue of jobs that are waiting for workers.
 
     };
 
@@ -113,8 +113,8 @@ namespace Gardener
 
         JobQueue* const       m_pJobQueueS; // Reference to the job queue of getting jobs. Shared between fibers.
                                             // Read only, no need for protection.
-        JobSystem* const      m_pJobSysS;  // Reference to the job system to informing the system that a job has done.
-                                           // Shared between fibers. Read only, no need for protection.
+        JobSystem* const      m_pJobSysS;   // Reference to the job system to informing the system that a job has done.
+                                            // Shared between fibers. Read only, no need for protection.
     };
 
     /*  
@@ -145,41 +145,29 @@ namespace Gardener
             typedef void (*PfnJobEntryInput)(T*);
             static_assert(std::is_same<FT, PfnJobEntryInput>::value, 
                           "The input jobEntry function pointer is incompatiable with the input pTask pointer.");
-            AddAJobInternal(static_cast<void*>(jobEntry), static_cast<void*>(pTask), jobId);
+            AddAJobInternalF(static_cast<void*>(jobEntry), static_cast<void*>(pTask), jobId);
         }
 
-        void AddJobs(PfnJobEntry* const pJobsEntries, uint32_t jobCnt, uint64_t* jobIds);
-
-        // The srcJobEntry would execute after the desJobEntry finishes.
-        void AddDepJobs(PfnJobEntry srcJobEntry, PfnJobEntry dstJobEntry, uint64_t* jobIds);
-        
         // Called by the worker when it finishes the job.
-        void JobFinishes(const uint64_t jobId);
-
-        // If the job finishes, the func would return nullptr. Fibers should not use this function.
-        Job* GetJobPtrFromId(uint64_t jobId);
+        void JobFinishesF(const uint64_t jobId);
 
         // Wait for all submitted jobs done in the main thread.
         void WaitJobsComplete();
 
-        void AJobDone();
-
     private:
-        void AddAJobInternal(void* jobEntry, void* pTask, uint64_t& jobId);
+        void AddAJobInternalF(void* jobEntry, void* pTask, uint64_t& jobId);
 
-        JobQueue* m_pJobQueue;
+        JobQueue*          m_pJobQueueS;
         std::list<Worker*> m_pWorkers;
-        uint32_t  m_workersCnt;
 
-        std::unordered_map<uint64_t, Job*>*  m_pJobsHandleTable; // The handle table stores all jobs instances.
-        uint64_t                             m_servedJobsCnt;    // Will be used to assign a unique ID for the input
-                                                                 // job. Shared Resource.
-        std::mutex                           m_handleTblMutex;   // The job handle table maybe accessd by multiple 
-                                                                 // threads. E.g. The main thread adds jobs to the
-                                                                 // table. The worker threads remove jobs from the
-                                                                 // handle table or add jobs from the fiber. Shared
-                                                                 // resource.
-        uint64_t                             m_doneJobsCnt;
-        std::mutex                           m_doneJobsCntMutex;
+        std::unordered_map<uint64_t, Job*>*  m_pJobsHandleTableS; // The handle table stores all jobs instances.
+        uint64_t                             m_servedJobsCnt;     // Will be used to assign a unique ID for the input
+                                                                  // job. Shared Resource.
+        boost::fibers::mutex                 m_handleTblMutex;    // The job handle table maybe accessd by multiple 
+                                                                  // threads. E.g. The main thread adds jobs to the
+                                                                  // table. The worker threads remove jobs from the
+                                                                  // handle table or add jobs from the fiber. Shared
+                                                                  // resource.
+        uint64_t                             m_doneJobsCntS;      // It needs to share the handle table mutex.
     };
 }
