@@ -73,13 +73,10 @@ namespace Gardener
     {
         while (1)
         {
-            m_handleTblMutex.lock();
             if (m_doneJobsCntS == m_servedJobsCnt)
             {
-                m_handleTblMutex.unlock();
                 break;
             }
-            m_handleTblMutex.unlock();
         }
     }
 
@@ -121,7 +118,9 @@ namespace Gardener
                 pWorker->m_retiredJobQueueMutex.unlock();
                 isLock = false;
 
-                delete pWorker->m_fiberListS.at(id);
+                boost::fibers::fiber* pFiber = pWorker->m_fiberListS.at(id);
+                pFiber->join();
+                delete pFiber;
                 pWorker->m_fiberListS.erase(id);
 
                 // Tell the job system to delete the job from the memory.
@@ -142,6 +141,9 @@ namespace Gardener
                 pWorker->m_fiberListS.insert({ pJob->GetId(),
                                               new boost::fibers::fiber(&Worker::EntryFuncWrapperF, pWorker, pJob)});
             }
+
+            boost::this_fiber::yield();
+            std::this_thread::yield();
         }
     }
 

@@ -9,7 +9,8 @@
 #include <mutex>
 #include <list>
 
-// TODO: Code standard enforcement.
+// TODO: The fiber mutex are spinning-lock. We may need to redesign.
+// Previously, I thought that is a yield.
 // S postfix on data name for shared resources.
 // T postfix on function name with thread syn.
 // F postfix on function name with fiber syn (non-preemptive).
@@ -97,6 +98,10 @@ namespace Gardener
 
         // The fiber list is shared between the main thread and the worker thread. It won't have the contension because
         // the main thread only access it after the worker thread joins. So, no need for the protection.
+        // 
+        // The programmer must ensure that the destructor is never executed while the fiber is still fiber::joinable(). 
+        // Even if you know that the fiber has completed, you must still call either fiber::join() or fiber::detach() 
+        // before destroying the fiber object.
         std::unordered_map<uint64_t, boost::fibers::fiber*> m_fiberListS;
 
         // Used to free fibers in the fiberList during each workerLoop. This queue is shared among all the fibers in
