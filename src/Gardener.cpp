@@ -40,6 +40,7 @@ namespace Gardener
     }
 
     // ================================================================================================================
+    // Called by the main thread.
     void JobSystem::AddAJobInternalF(
         void* jobEntry,
         void* pTask,
@@ -47,6 +48,8 @@ namespace Gardener
     {
         Job* pJob = nullptr;
         {
+            // Putting jobs into the worker is more important to the performance than getting the finish signal.
+            // So, we use the spinning-lock in adding jobs and try-lock-yield in the finish signal.
             m_handleTblMutex.lock();
             PfnJobEntry castEntry = static_cast<PfnJobEntry>(jobEntry);
             pJob = new Job(castEntry, pTask, m_servedJobsCnt);
@@ -60,9 +63,14 @@ namespace Gardener
     }
     
     // ================================================================================================================
+    // Called by fibers on all threads.
     void JobSystem::JobFinishesF(const uint64_t jobId)
     {
-        m_handleTblMutex.lock();
+        while (m_handleTblMutex.try_lock() == false)
+        {
+            boost::this_fiber::yield();
+        }
+
         m_pJobsHandleTableS->erase(jobId);
         m_doneJobsCntS++;
         m_handleTblMutex.unlock();
@@ -77,6 +85,10 @@ namespace Gardener
             {
                 break;
             }
+
+            // Normally, the wait job complete is called much eariler than finish. So, we can yield the thread to save
+            // some time-slices.
+            std::this_thread::yield();
         }
     }
 
@@ -99,39 +111,48 @@ namespace Gardener
         while (1)
         {
             // Check whether the worker gets a stop signal. Jump out of the loop if there is one.
+            if (pWorker->m_stopSignalS)
             {
-                std::lock_guard<std::mutex> stopSigLock(pWorker->m_stopSignalMutex);
-                if (pWorker->m_stopSignalS)
+                break;
+            }
+
+            // Retire all the jobs in the retire queue. The work is not in high-priority so we can skip if the resource
+            // is not ready. (Free all fibers with the job ids specified in the retired queue)
+            if (pWorker->m_retiredJobQueueMutex.try_lock())
+            {
+                if (pWorker->m_retiredJobQueueS.empty() != true)
                 {
-                    break;
+                    // Use the retired job queue resource all together at first, then informing the job system,
+                    // because we want to avoid grabbing two mutex in hand to avoid the deadlock.
+                    uint64_t* pIdArray = new uint64_t[pWorker->m_retiredJobQueueS.size()];
+                    uint32_t arraySize = pWorker->m_retiredJobQueueS.size();
+                    for (uint32_t i = 0; pWorker->m_retiredJobQueueS.empty() != true; i++)
+                    {
+                        uint64_t id = pWorker->m_retiredJobQueueS.front();
+                        pWorker->m_retiredJobQueueS.pop();
+                        
+                        boost::fibers::fiber* pFiber = pWorker->m_fiberListS.at(id);
+                        pFiber->join();
+                        delete pFiber;
+                        pWorker->m_fiberListS.erase(id);
+
+                        pIdArray[i] = id;
+                    }
+                    pWorker->m_retiredJobQueueMutex.unlock();
+
+                    // Tell the job system to delete the job from the memory.
+                    for (uint32_t i = 0; i < arraySize; i++)
+                    {
+                        pWorker->m_pJobSysS->JobFinishesF(pIdArray[i]);
+                    }
+                    delete pIdArray;
+                }
+                else
+                {
+                    pWorker->m_retiredJobQueueMutex.unlock();
                 }
             }
 
-            // Retire all the jobs in the retire queue. 
-            // (Free all fibers with the job ids specified in the retired queue)
-            pWorker->m_retiredJobQueueMutex.lock();
-            bool isLock = true;
-            while (pWorker->m_retiredJobQueueS.empty() != true)
-            {
-                uint64_t id = pWorker->m_retiredJobQueueS.front();
-                pWorker->m_retiredJobQueueS.pop();
-                pWorker->m_retiredJobQueueMutex.unlock();
-                isLock = false;
-
-                boost::fibers::fiber* pFiber = pWorker->m_fiberListS.at(id);
-                pFiber->join();
-                delete pFiber;
-                pWorker->m_fiberListS.erase(id);
-
-                // Tell the job system to delete the job from the memory.
-                pWorker->m_pJobSysS->JobFinishesF(id);
-            }
-
-            if (isLock)
-            {
-                pWorker->m_retiredJobQueueMutex.unlock();
-            }
-            
             // Get a job from the jobQueue. If there is one, then we create a fiber for it and execute it. If not, we
             // come back to the spinning loop to check the queue until there is a stop signal or there is a job.
             Job* pJob = pWorker->m_pJobQueueS->SendOutAJobF();
@@ -142,8 +163,8 @@ namespace Gardener
                                               new boost::fibers::fiber(&Worker::EntryFuncWrapperF, pWorker, pJob)});
             }
 
+            // Let the main fiber yield and let the worker thread execute the user's work.
             boost::this_fiber::yield();
-            std::this_thread::yield();
         }
     }
 
@@ -183,10 +204,7 @@ namespace Gardener
         // Block the caller thread to wait for the worker thread.
         if (m_pThread != nullptr)
         {
-            {
-                std::lock_guard<std::mutex> stopSigLock(m_stopSignalMutex);
-                m_stopSignalS = true;
-            }
+            m_stopSignalS = true;
 
             // Wait until the worker thread stop working. We can delete all the fiber objects in the worker.
             m_pThread->join();
@@ -221,7 +239,7 @@ namespace Gardener
     // ================================================================================================================
     Job* JobQueue::SendOutAJobF()
     {
-        // It the fiber caller is blocked here, it just jumps back to the scheduler of the attached thread.
+        // It would just spinning if the mutex is owned by others.
         m_queueAccessMutex.lock();
         Job* pRes = nullptr;
         

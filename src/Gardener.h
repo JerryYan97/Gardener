@@ -14,6 +14,9 @@
 // S postfix on data name for shared resources.
 // T postfix on function name with thread syn.
 // F postfix on function name with fiber syn (non-preemptive).
+//
+// Three priorities of fiber works and their locks usage: Low - If-Try-Lock; Mid: While-Try-Lock; High: Lock.
+//
 namespace Gardener
 {
     class JobSystem;
@@ -112,9 +115,9 @@ namespace Gardener
 
         // The stop signal would be shared between the main thread and the worker thread. When the StopWork() is called
         // in the main thread, it would set the stop signal to true. Meanwhile in the worker thread's WorkerLoop(), the
-        // worker thread would peroidically check whether it needs to stop working on new jobs in the job queue.
+        // worker thread would peroidically check whether it needs to stop working on new jobs in the job queue. Write
+        // at very beginning, only read afterward. No need for protection.
         bool                  m_stopSignalS;
-        std::mutex            m_stopSignalMutex;
 
         JobQueue* const       m_pJobQueueS; // Reference to the job queue of getting jobs. Shared between fibers.
                                             // Read only, no need for protection.
