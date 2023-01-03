@@ -2,6 +2,8 @@
 
 Inspired by the Game Engine Architecture book and Naughty Dog's fiber-based job system slides on GDC, this project aims to serve as an implementation reference and a personal game engine building block.
 
+![Architecture](./img/My%20Architecture.png)
+
 ## Example
 
 ```
